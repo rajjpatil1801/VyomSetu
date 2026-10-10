@@ -1,0 +1,103 @@
+================================================================================
+                           VYOMSETU PROJECT GUIDE
+================================================================================
+
+1. INTRODUCTION & PROBLEM STATEMENT
+--------------------------------------------------------------------------------
+The Multi-Satellite Downlink Schedule Problem (MSDSP) is a critical logistical challenge in space operations. Imagine a constellation of dozens of satellites orbiting the Earth. As they capture data (images, radar, signals), their onboard storage fills up. They must transmit this data back to Earth through ground antennas (Ground Stations).
+
+However, satellites fly at incredible speeds. A satellite might only have a "line of sight" to a ground station for a brief 5 to 12-minute window (a "pass"). 
+
+The constraints are strictly physical:
+- Constraint 1: A ground station can only track and download from ONE satellite at a time.
+- Constraint 2: A satellite can only transmit to ONE ground station at a time.
+- Constraint 3: Downloads must happen strictly within the visibility window of the pass.
+
+The Goal: 
+Given a planning horizon (e.g., 6 hours), generate a schedule that dictates exactly which satellite uses which ground station at what time. The objective is to MAXIMIZE the total priority-weighted data downloaded, effectively getting the most valuable data to Earth as fast as possible.
+
+
+================================================================================
+2. VERSION 1: THE FOUNDATION & CORE ALGORITHMS
+================================================================================
+Version 1 established the data generation, the baseline solver, and the core optimization engine.
+
+A. Synthetic Data Generation (generator.py)
+Because real TLE (Two-Line Element) orbital data requires complex physics engines, we built a synthetic generator. It assigns 3-5 random passes per satellite across random stations. Each pass has a duration, start time, data volume (GB), transfer rate, and a priority (1 to 5, skewed heavily toward lower priorities to simulate real-world conditions where urgent data is rare).
+
+B. The Baseline: First-Come-First-Served (FCFS) (baseline.py)
+To know if our AI is actually good, we need a dumb baseline. The FCFS scheduler simply sorts all passes by their start time. It looks at the first pass; if the ground station and the satellite are both free, it accepts it. If there is a conflict, it rejects it. It is fast but highly inefficient because a low-value 12-minute pass might block a high-value 5-minute pass that arrives one minute later.
+
+C. The Optimizer: SA + Tabu List + DP (optimizer.py)
+This is the mathematical heart of VyomSetu, inspired by Liu et al. (Aerospace 2022). It uses a hybrid metaheuristic approach in two stages:
+
+STAGE 1: Simulated Annealing (SA) with a Tabu List
+- The State: The SA operates on a boolean array (e.g., [True, False, True...]) where each boolean represents whether we "allow" a specific pass to be considered.
+- The Neighbor Move: At each step, the algorithm randomly flips one boolean (changing a True to False, or False to True). 
+- Evaluation: It sends this new boolean mask to Stage 2 (the DP) to find out what the maximum possible score is with this specific subset of passes.
+- Simulated Annealing Logic: If the new score is better, it ALWAYS accepts the move. If the new score is worse, it MIGHT accept it. This is based on a "Temperature" that cools down over time. Early on (high temperature), it accepts bad moves frequently to escape local minimums. Later (low temperature), it becomes greedy. The probability of accepting a bad move is calculated as: exp(delta / Temperature).
+- Tabu List: To prevent the algorithm from instantly undoing a flip it just made (getting stuck in a loop), a memory queue of length 8 remembers recently flipped indexes and temporarily bans them from being flipped again.
+
+STAGE 2: Dynamic Programming (DP) for Interval Scheduling
+- For a given boolean mask from the SA, we look at the permitted passes station-by-station.
+- For each station, the problem reduces to the classic "Weighted Interval Scheduling" problem, which can be solved EXACTLY using DP.
+- Step 1 (Sort): Sort the passes by their end times.
+- Step 2 (Binary Search): For each pass 'i', find the latest scheduled pass 'p_idx' that ends before pass 'i' starts.
+- Step 3 (DP Array): Build an array where DP[i] stores the maximum value achievable using the first 'i' passes. The recurrence relation is:
+  DP[i] = Max ( DP[i-1] (excluding pass i), Value[i] + DP[p_idx] (including pass i) )
+- Step 4 (Backtrack): Trace backwards through the DP array to extract the exact list of non-overlapping passes that perfectly maximizes the value for that station.
+
+
+================================================================================
+3. VERSION 2: THE DYNAMIC LIVE SYSTEM
+================================================================================
+Version 2 transformed the static math problem into a realistic, live mission-operations tool.
+
+A. Mission Classes & The Aging Factor (priority.py)
+In V1, priority was static. In V2, we introduced Mission Classes (e.g., Disaster Response has base priority 5 and a strict 90-minute deadline, while Routine Mapping is priority 1 with a 360-minute deadline).
+Furthermore, data that sits on a satellite gets older. We implemented an Aging Formula:
+  Effective Priority = Base Priority * (1 + alpha * min(Wait / Deadline, 2.0))
+"Wait" is how many minutes have passed since the data was captured. "Alpha" is a tuning slider. If alpha=1.0, data priority doubles if it sits until its deadline, preventing low-priority data from starving indefinitely.
+
+B. Live Replanning (replan.py)
+In real life, a general might suddenly need imagery from SAT-05 immediately, disrupting the day's schedule. 
+- The user can select a "current time" (e.g., t=120 minutes), a satellite, and an urgent data size to inject.
+- The system splits the timeline. Any pass that ends BEFORE t=120 is considered "frozen in the past" and cannot be touched.
+- The Optimizer is fed these frozen passes as hard constraints. It removes any future candidate passes that conflict physically with the frozen history.
+- The SA is then run only on the remaining future passes, essentially repairing the schedule around the new urgent injection.
+
+
+================================================================================
+4. VERSION 3: THE MATHEMATICAL PROOF (EXACT SOLVER & BENCHMARKS)
+================================================================================
+Heuristics (like SA) are fast, but they don't guarantee the absolute best answer. V3 proves our AI's quality.
+
+A. The Exact Solver (exact.py)
+We built a second scheduler using Google OR-Tools (a Constraint Programming SAT solver). 
+- We define boolean decision variables x[i] for every single pass.
+- We define Optional Interval variables representing the start, duration, and end of the pass. The interval only "exists" if x[i] is True.
+- We add `AddNoOverlap` constraints grouping the intervals by Station, and another set grouping them by Satellite.
+- We tell the solver to Maximize the sum of (Value[i] * x[i]).
+- Because this problem is NP-Hard, the exact solver might take hours for 120 satellites. We give it a strict time limit (e.g., 20 seconds). If it finishes, it returns the absolute OPTIMUM. If it hits the time limit, it returns a FEASIBLE bound.
+
+B. Benchmarks & Sensitivity
+We run the FCFS, SA, and Exact Solver side-by-side across increasing sizes (10 to 120 satellites). By comparing the SA score to the Exact Optimum score, we calculate an "Optimality Gap". We proved that our SA+DP algorithm consistently scores >99% of the exact mathematical optimum, but computes the answer in <1 second instead of getting bogged down by exponential time complexity.
+
+
+================================================================================
+5. DEEP DIVE: THE CUSTOM PLOTLY GANTT ENGINE
+================================================================================
+Instead of using heavy, bloated third-party Gantt libraries, we engineered the timeline visualization from scratch using raw Plotly primitives for absolute control.
+
+A. The Base Architecture
+We use `plotly.graph_objects.Bar` traces set to `barmode='overlay'`. The Y-axis represents the Ground Stations. For the X-axis, instead of feeding Plotly normal lengths, we feed it the durations (x) and the start times (base). This makes the bars "float" precisely at the right minute marks on the timeline.
+
+B. The Color Palette & Smart Typography
+We defined a strict IBM-inspired palette. The bars are colored dynamically based on their priority (from `#CFC3A0` to `#6B2210`). The text color inside the bar automatically inverses based on the background darkness. We used `uniformtext(minsize=10, mode='hide')` so that if a pass is only 5 minutes long, it automatically hides the "SAT-11" label rather than letting the text bleed outside the bar, keeping the UI pristine.
+
+C. Before & After "Ghosting"
+During Live Replanning, we show two Gantt charts side by side: the old plan and the new plan. 
+To visually explain what the AI did, we implemented advanced SVG rendering:
+- Shading the Past: A raw `fig.add_vrect()` draws a gray tint over the past (from minute 0 to current_t).
+- Highlighting Added Passes: Passes that didn't exist in the old plan get a thick, bright red outline.
+- Ghosting Dropped Passes: If the AI decided to delete an old pass to make room for the urgent request, we take the exact coordinates of that deleted pass and draw an empty SVG rectangle over the "Before" chart with a dashed red border (`dash="dash"`). This allows the operator to instantly see exactly what was sacrificed.

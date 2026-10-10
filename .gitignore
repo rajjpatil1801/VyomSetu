@@ -1,0 +1,26 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest
+.pytest_cache/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Caches and output data
+data/tle_cache*.txt
+data/pass_cache_*.csv
+data/track_cache_*.csv
+results/benchmark.csv
+results/benchmark_summary.json
+
+# Scratch scripts
+scratch/
